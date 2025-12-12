@@ -21,6 +21,7 @@ pub struct RunResult {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
+    #[allow(dead_code)]
     pub exit_code: i32,
     pub time: u32,
     pub memory: u32,
@@ -51,6 +52,13 @@ pub enum ExecuteOutput {
     Stdout(String),
     Stderr(String),
     Complete { exit_code: i32, time: u32, memory: u32 },
+}
+
+struct MetaInfo {
+    time: u32,
+    memory: u32,
+    status: RunStatus,
+    exit_code: i32,
 }
 
 impl Isolate {
@@ -203,8 +211,12 @@ impl Isolate {
                     let exit_code = result.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
                     let _ = stdout_done_rx.recv().await;
                     let _ = stderr_done_rx.recv().await;
-                    let (time, memory) = Self::parse_meta_file(&meta_path).await;
-                    let _ = event_tx.send(ExecuteOutput::Complete { exit_code, time, memory }).await;
+                    let meta = Self::read_meta(&meta_path).await;
+                    let _ = event_tx.send(ExecuteOutput::Complete {
+                        exit_code,
+                        time: meta.time,
+                        memory: meta.memory,
+                    }).await;
                     let _ = std::fs::remove_file(&meta_path);
                     return;
                 }
@@ -225,7 +237,7 @@ impl Isolate {
         }
     }
 
-    async fn parse_meta_file(meta_path: &str) -> (u32, u32) {
+    async fn read_meta(meta_path: &str) -> MetaInfo {
         let content = tokio::fs::read_to_string(meta_path)
             .await
             .unwrap_or_default();
@@ -238,6 +250,11 @@ impl Isolate {
             })
             .collect();
 
+        let status_code = meta.get("status").map(|s| s.as_str());
+        let exit_code: i32 = meta
+            .get("exitcode")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let time: u32 = meta
             .get("time")
             .and_then(|s| s.parse::<f64>().ok())
@@ -250,7 +267,19 @@ impl Isolate {
             .map(|m: u32| m / 1024)
             .unwrap_or(0);
 
-        (time, memory)
+        let status = match status_code {
+            Some("TO") => RunStatus::TimeLimitExceeded,
+            Some("SG") if meta.get("exitsig").map(|s| s.as_str()) == Some("9") => {
+                RunStatus::MemoryLimitExceeded
+            }
+            Some("SG") | Some("RE") => RunStatus::RuntimeError,
+            Some("XX") => RunStatus::InternalError,
+            None if exit_code == 0 => RunStatus::Ok,
+            None => RunStatus::RuntimeError,
+            _ => RunStatus::RuntimeError,
+        };
+
+        MetaInfo { time, memory, status, exit_code }
     }
 
     pub async fn release(&self, box_id: u32) {
@@ -391,64 +420,19 @@ impl Isolate {
             .await
             .unwrap_or_default();
 
-        self.parse_meta(&meta_path, stdout, stderr).await
+        let meta = Self::read_meta(&meta_path).await;
+        Ok(Self::to_run_result(meta, stdout, stderr))
     }
 
-    async fn parse_meta(
-        &self,
-        meta_path: &str,
-        stdout: String,
-        stderr: String,
-    ) -> Result<RunResult> {
-        let content = tokio::fs::read_to_string(meta_path)
-            .await
-            .unwrap_or_default();
-
-        let meta: HashMap<String, String> = content
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.splitn(2, ':');
-                Some((parts.next()?.to_string(), parts.next()?.to_string()))
-            })
-            .collect();
-
-        let status_code = meta.get("status").map(|s| s.as_str());
-        let exit_code: i32 = meta
-            .get("exitcode")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let time: u32 = meta
-            .get("time")
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|t| (t * 1000.0) as u32)
-            .unwrap_or(0);
-        let memory: u32 = meta
-            .get("cg-mem")
-            .or_else(|| meta.get("max-rss"))
-            .and_then(|s| s.parse().ok())
-            .map(|m: u32| m / 1024)
-            .unwrap_or(0);
-
-        let status = match status_code {
-            Some("TO") => RunStatus::TimeLimitExceeded,
-            Some("SG") if meta.get("exitsig").map(|s| s.as_str()) == Some("9") => {
-                RunStatus::MemoryLimitExceeded
-            }
-            Some("SG") | Some("RE") => RunStatus::RuntimeError,
-            Some("XX") => RunStatus::InternalError,
-            None if exit_code == 0 => RunStatus::Ok,
-            None => RunStatus::RuntimeError,
-            _ => RunStatus::RuntimeError,
-        };
-
-        Ok(RunResult {
-            success: status == RunStatus::Ok && exit_code == 0,
+    fn to_run_result(meta: MetaInfo, stdout: String, stderr: String) -> RunResult {
+        RunResult {
+            success: meta.status == RunStatus::Ok && meta.exit_code == 0,
             stdout,
             stderr,
-            exit_code,
-            time,
-            memory,
-            status,
-        })
+            exit_code: meta.exit_code,
+            time: meta.time,
+            memory: meta.memory,
+            status: meta.status,
+        }
     }
 }

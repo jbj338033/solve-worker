@@ -1,12 +1,11 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::language::Language;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JudgeJob {
-    pub submission_id: Uuid,
+    pub submission_id: i64,
     pub language: Language,
     pub code: String,
     pub time_limit: u32,
@@ -17,7 +16,7 @@ pub struct JudgeJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TestCase {
-    pub id: Uuid,
+    pub id: i64,
     pub input: String,
     pub output: String,
     pub order: u32,
@@ -26,7 +25,7 @@ pub struct TestCase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteJob {
-    pub execution_id: Uuid,
+    pub execution_id: i64,
     pub language: Language,
     pub code: String,
     pub time_limit: u32,
@@ -50,7 +49,7 @@ pub enum JudgeResult {
 pub enum JudgeEvent {
     Progress {
         #[serde(rename = "testcaseId")]
-        testcase_id: Uuid,
+        testcase_id: i64,
         result: JudgeResult,
         time: u32,
         memory: u32,
