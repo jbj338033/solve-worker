@@ -25,7 +25,7 @@ pub struct TestCase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteJob {
-    pub execution_id: i64,
+    pub execution_id: String,
     pub language: Language,
     pub code: String,
     pub time_limit: u32,
