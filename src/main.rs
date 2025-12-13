@@ -1,7 +1,7 @@
-mod isolate;
 mod job;
 mod language;
 mod queue;
+mod sandbox;
 mod service;
 
 use anyhow::Result;

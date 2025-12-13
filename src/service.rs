@@ -1,22 +1,22 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::isolate::{ExecuteOutput, Isolate, RunStatus};
 use crate::job::{ExecuteCommand, ExecuteEvent, ExecuteJob, JudgeEvent, JudgeJob, JudgeResult};
+use crate::sandbox::{ExecuteOutput, RunStatus, Sandbox};
 
 pub struct WorkerService {
-    isolate: Arc<Isolate>,
+    sandbox: Arc<Sandbox>,
 }
 
 impl WorkerService {
     pub fn new(max_boxes: usize) -> Self {
         Self {
-            isolate: Arc::new(Isolate::new(max_boxes)),
+            sandbox: Arc::new(Sandbox::new(max_boxes)),
         }
     }
 
     pub async fn judge(&self, job: JudgeJob, event_tx: mpsc::Sender<JudgeEvent>) {
-        let compile_result = match self.isolate.compile(job.language, &job.code).await {
+        let compile_result = match self.sandbox.compile(job.language, &job.code).await {
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx
@@ -57,7 +57,7 @@ impl WorkerService {
 
         for (i, testcase) in testcases.iter().enumerate() {
             let run_result = match self
-                .isolate
+                .sandbox
                 .run(
                     box_id,
                     job.language,
@@ -69,7 +69,7 @@ impl WorkerService {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    self.isolate.release(box_id).await;
+                    self.sandbox.release(box_id).await;
                     let _ = event_tx
                         .send(JudgeEvent::Complete {
                             result: JudgeResult::InternalError,
@@ -121,7 +121,7 @@ impl WorkerService {
                 .await;
         }
 
-        self.isolate.release(box_id).await;
+        self.sandbox.release(box_id).await;
 
         let final_score = if total == 0 {
             0
@@ -146,7 +146,7 @@ impl WorkerService {
         event_tx: mpsc::Sender<ExecuteEvent>,
         mut command_rx: mpsc::Receiver<ExecuteCommand>,
     ) {
-        let compile_result = match self.isolate.compile(job.language, &job.code).await {
+        let compile_result = match self.sandbox.compile(job.language, &job.code).await {
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx
@@ -170,12 +170,12 @@ impl WorkerService {
         }
 
         let box_id = compile_result.box_id.unwrap();
-        let isolate = self.isolate.clone();
+        let sandbox = self.sandbox.clone();
 
         let (output_tx, mut output_rx) = mpsc::channel::<ExecuteOutput>(32);
 
         let handle = match self
-            .isolate
+            .sandbox
             .run_execute(box_id, job.language, job.time_limit, job.memory_limit, output_tx)
             .await
         {
@@ -186,13 +186,13 @@ impl WorkerService {
                         message: e.to_string(),
                     })
                     .await;
-                isolate.release(box_id).await;
+                sandbox.release(box_id).await;
                 return;
             }
         };
 
         if event_tx.send(ExecuteEvent::Ready).await.is_err() {
-            isolate.release(box_id).await;
+            sandbox.release(box_id).await;
             return;
         }
 
@@ -228,7 +228,7 @@ impl WorkerService {
             }
         }
 
-        isolate.release(box_id).await;
+        sandbox.release(box_id).await;
     }
 }
 
