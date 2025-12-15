@@ -303,67 +303,58 @@ impl Sandbox {
     fn base_nsjail_args(&self, box_id: u32, time_limit_sec: f64, memory_mb: u32) -> Vec<String> {
         let box_dir = self.box_dir(box_id);
 
-        vec![
-            // Mode: execute once
+        let mut args = vec![
             "-Mo".to_string(),
-            // Quiet mode (no nsjail logs to stderr)
             "-Q".to_string(),
-            // Time limit (wall time)
             "-t".to_string(),
             format!("{}", time_limit_sec.ceil() as u32),
-            // CPU time limit
             "--rlimit_cpu".to_string(),
             format!("{}", (time_limit_sec * 2.0).ceil() as u32),
-            // Memory limit (address space in MB)
             "--rlimit_as".to_string(),
             format!("{}", memory_mb),
-            // Max processes
             "--rlimit_nproc".to_string(),
             "64".to_string(),
-            // Max open files
             "--rlimit_nofile".to_string(),
             "64".to_string(),
-            // Max file size (10MB)
             "--rlimit_fsize".to_string(),
             "10".to_string(),
-            // Stack size (unlimited for Java)
             "--rlimit_stack".to_string(),
             "soft".to_string(),
-            // User/Group (run as nobody)
             "--user".to_string(),
             "99999".to_string(),
             "--group".to_string(),
             "99999".to_string(),
-            // Hostname
             "--hostname".to_string(),
             "sandbox".to_string(),
-            // Mount system directories read-only
             "-R".to_string(),
             "/bin".to_string(),
             "-R".to_string(),
             "/lib".to_string(),
-            "-R".to_string(),
-            "/lib64".to_string(),
+        ];
+
+        if std::path::Path::new("/lib64").exists() {
+            args.extend(["-R".to_string(), "/lib64".to_string()]);
+        }
+
+        args.extend([
             "-R".to_string(),
             "/usr".to_string(),
             "-R".to_string(),
             "/etc/alternatives".to_string(),
-            // Mount box directory read-write
             "-B".to_string(),
             format!("{}:/box", box_dir.display()),
-            // Working directory
             "--cwd".to_string(),
             "/box".to_string(),
-            // Disable network
             "--disable_clone_newnet".to_string(),
-            // Environment variables
             "--env".to_string(),
             "PATH=/usr/local/bin:/usr/bin:/bin".to_string(),
             "--env".to_string(),
             "HOME=/box".to_string(),
             "--env".to_string(),
             "LANG=C.UTF-8".to_string(),
-        ]
+        ]);
+
+        args
     }
 
     async fn run_in_box(
