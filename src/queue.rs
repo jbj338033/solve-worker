@@ -4,7 +4,7 @@ use redis::AsyncCommands;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::job::{ExecuteCommand, ExecuteEvent, ExecuteJob, JudgeEvent, JudgeJob};
 use crate::service::WorkerService;
@@ -110,20 +110,60 @@ impl Worker {
     async fn handle_judge(&self, payload: &str) -> Result<()> {
         let job: JudgeJob = serde_json::from_str(payload)?;
         let submission_id = job.submission_id.to_string();
-        info!("Processing judge job: {}", submission_id);
+        info!(
+            submission_id = %submission_id,
+            language = ?job.language,
+            testcases = job.testcases.len(),
+            time_limit = job.time_limit,
+            memory_limit = job.memory_limit,
+            code_len = job.code.len(),
+            "[Judge] Job received"
+        );
 
         let client = redis::Client::open(self.redis_url.as_str())?;
         let mut conn = client.get_multiplexed_async_connection().await?;
         let stream_key = judge_stream_key(&submission_id);
+        debug!(submission_id = %submission_id, stream_key = %stream_key, "[Judge] Stream key created");
 
         let (event_tx, mut event_rx) = mpsc::channel::<JudgeEvent>(32);
 
         let service = self.service.clone();
+        let sid = submission_id.clone();
         tokio::spawn(async move {
+            debug!(submission_id = %sid, "[Judge] Starting judge task");
             service.judge(job, event_tx).await;
+            debug!(submission_id = %sid, "[Judge] Judge task finished");
         });
 
+        let mut event_count = 0u32;
         while let Some(event) = event_rx.recv().await {
+            event_count += 1;
+            match &event {
+                JudgeEvent::Progress { testcase_id, result, time, memory, score, progress } => {
+                    debug!(
+                        submission_id = %submission_id,
+                        testcase_id = %testcase_id,
+                        result = ?result,
+                        time = %time,
+                        memory = %memory,
+                        score = %score,
+                        progress = %progress,
+                        "[Judge] Progress event"
+                    );
+                }
+                JudgeEvent::Complete { result, score, time, memory, error } => {
+                    info!(
+                        submission_id = %submission_id,
+                        result = ?result,
+                        score = %score,
+                        time = %time,
+                        memory = %memory,
+                        error = ?error,
+                        "[Judge] Complete event"
+                    );
+                }
+            }
+
             if let Ok(data) = serde_json::to_string(&event) {
                 let _: Result<String, _> = conn.xadd(&stream_key, "*", &[("data", &data)]).await;
             }
@@ -134,7 +174,7 @@ impl Worker {
             }
         }
 
-        info!("Judge completed: {}", submission_id);
+        info!(submission_id = %submission_id, event_count = %event_count, "[Judge] Completed");
         Ok(())
     }
 

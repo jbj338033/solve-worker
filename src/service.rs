@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 use crate::job::{ExecuteCommand, ExecuteEvent, ExecuteJob, JudgeEvent, JudgeJob, JudgeResult};
 use crate::sandbox::{ExecuteOutput, RunStatus, Sandbox};
@@ -16,9 +17,18 @@ impl WorkerService {
     }
 
     pub async fn judge(&self, job: JudgeJob, event_tx: mpsc::Sender<JudgeEvent>) {
+        let submission_id = job.submission_id;
+        info!(
+            submission_id = %submission_id,
+            language = ?job.language,
+            "[Service] Starting judge"
+        );
+
+        debug!(submission_id = %submission_id, "[Service] Compiling code");
         let compile_result = match self.sandbox.compile(job.language, &job.code).await {
             Ok(r) => r,
             Err(e) => {
+                error!(submission_id = %submission_id, error = %e, "[Service] Compile internal error");
                 let _ = event_tx
                     .send(JudgeEvent::Complete {
                         result: JudgeResult::InternalError,
@@ -33,6 +43,11 @@ impl WorkerService {
         };
 
         if !compile_result.success {
+            warn!(
+                submission_id = %submission_id,
+                error = ?compile_result.error,
+                "[Service] Compile error"
+            );
             let _ = event_tx
                 .send(JudgeEvent::Complete {
                     result: JudgeResult::CompileError,
@@ -46,6 +61,8 @@ impl WorkerService {
         }
 
         let box_id = compile_result.box_id.unwrap();
+        info!(submission_id = %submission_id, box_id = %box_id, "[Service] Compile success");
+
         let total = job.testcases.len();
         let mut accepted = 0u32;
         let mut overall_result = JudgeResult::Accepted;
@@ -56,6 +73,15 @@ impl WorkerService {
         testcases.sort_by_key(|tc| tc.order);
 
         for (i, testcase) in testcases.iter().enumerate() {
+            debug!(
+                submission_id = %submission_id,
+                testcase_id = %testcase.id,
+                testcase_order = %testcase.order,
+                "[Service] Running testcase {}/{}",
+                i + 1,
+                total
+            );
+
             let run_result = match self
                 .sandbox
                 .run(
@@ -69,6 +95,12 @@ impl WorkerService {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    error!(
+                        submission_id = %submission_id,
+                        testcase_id = %testcase.id,
+                        error = %e,
+                        "[Service] Run internal error"
+                    );
                     self.sandbox.release(box_id).await;
                     let _ = event_tx
                         .send(JudgeEvent::Complete {
@@ -97,6 +129,17 @@ impl WorkerService {
                 RunStatus::InternalError => JudgeResult::InternalError,
             };
 
+            debug!(
+                submission_id = %submission_id,
+                testcase_id = %testcase.id,
+                result = ?judge_result,
+                status = ?run_result.status,
+                time = %run_result.time,
+                memory = %run_result.memory,
+                exit_code = %run_result.exit_code,
+                "[Service] Testcase result"
+            );
+
             max_time = max_time.max(run_result.time);
             max_memory = max_memory.max(run_result.memory);
 
@@ -121,6 +164,7 @@ impl WorkerService {
                 .await;
         }
 
+        debug!(submission_id = %submission_id, box_id = %box_id, "[Service] Releasing sandbox");
         self.sandbox.release(box_id).await;
 
         let final_score = if total == 0 {
@@ -128,6 +172,17 @@ impl WorkerService {
         } else {
             (accepted * 100) / total as u32
         };
+
+        info!(
+            submission_id = %submission_id,
+            result = ?overall_result,
+            score = %final_score,
+            time = %max_time,
+            memory = %max_memory,
+            accepted = %accepted,
+            total = %total,
+            "[Service] Judge complete"
+        );
 
         let _ = event_tx
             .send(JudgeEvent::Complete {

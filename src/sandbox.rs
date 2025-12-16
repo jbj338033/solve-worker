@@ -6,6 +6,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex, Semaphore};
+use tracing::{debug, error, warn};
 
 use crate::language::Language;
 
@@ -77,16 +78,22 @@ impl Sandbox {
     }
 
     pub async fn compile(&self, language: Language, code: &str) -> Result<CompileResult> {
+        debug!(language = ?language, code_len = code.len(), "[Sandbox] Acquiring box for compile");
         let box_id = self.acquire_box().await?;
+        debug!(box_id = %box_id, "[Sandbox] Box acquired");
 
         match self.compile_in_box(box_id, language, code).await {
             Ok(result) => {
                 if !result.success {
+                    debug!(box_id = %box_id, "[Sandbox] Compile failed, releasing box");
                     self.release_box(box_id).await;
+                } else {
+                    debug!(box_id = %box_id, "[Sandbox] Compile success");
                 }
                 Ok(result)
             }
             Err(e) => {
+                error!(box_id = %box_id, error = %e, "[Sandbox] Compile error, releasing box");
                 self.release_box(box_id).await;
                 Err(e)
             }
@@ -101,19 +108,41 @@ impl Sandbox {
         time_limit: u32,
         memory_limit: u32,
     ) -> Result<RunResult> {
+        debug!(
+            box_id = %box_id,
+            language = ?language,
+            input_len = input.len(),
+            time_limit = %time_limit,
+            memory_limit = %memory_limit,
+            "[Sandbox] Running code"
+        );
+
         let config = language.config();
         let box_dir = self.box_dir(box_id);
 
         tokio::fs::write(box_dir.join("input.txt"), input).await?;
 
-        self.run_in_box(
+        let result = self.run_in_box(
             box_id,
             config.execute_command,
             time_limit,
             memory_limit,
             Some("input.txt"),
         )
-        .await
+        .await?;
+
+        debug!(
+            box_id = %box_id,
+            status = ?result.status,
+            time = %result.time,
+            memory = %result.memory,
+            exit_code = %result.exit_code,
+            stdout_len = result.stdout.len(),
+            stderr_len = result.stderr.len(),
+            "[Sandbox] Run complete"
+        );
+
+        Ok(result)
     }
 
     pub async fn run_execute(
@@ -242,18 +271,23 @@ impl Sandbox {
     }
 
     async fn acquire_box(&self) -> Result<u32> {
+        debug!("[Sandbox] Waiting for available box");
         let permit = self.semaphore.clone().acquire_owned().await?;
         std::mem::forget(permit);
 
         let mut pool = self.box_pool.lock().await;
-        pool.pop().ok_or_else(|| anyhow!("No available boxes"))
+        let box_id = pool.pop().ok_or_else(|| anyhow!("No available boxes"))?;
+        debug!(box_id = %box_id, available = pool.len(), "[Sandbox] Box acquired from pool");
+        Ok(box_id)
     }
 
     async fn release_box(&self, box_id: u32) {
+        debug!(box_id = %box_id, "[Sandbox] Releasing box");
         self.cleanup_box(box_id).await;
         let mut pool = self.box_pool.lock().await;
         pool.push(box_id);
         self.semaphore.add_permits(1);
+        debug!(box_id = %box_id, available = pool.len(), "[Sandbox] Box returned to pool");
     }
 
     async fn cleanup_box(&self, box_id: u32) {
@@ -283,6 +317,7 @@ impl Sandbox {
 
     async fn init_cgroup(&self, box_id: u32) -> Result<()> {
         let cgroup_dir = self.cgroup_dir(box_id);
+        debug!(box_id = %box_id, cgroup_dir = %cgroup_dir.display(), "[Sandbox] Initializing cgroup");
         let _ = tokio::fs::remove_dir(&cgroup_dir).await;
         tokio::fs::create_dir_all(&cgroup_dir).await?;
         Ok(())
@@ -290,17 +325,20 @@ impl Sandbox {
 
     async fn cleanup_cgroup(&self, box_id: u32) {
         let cgroup_dir = self.cgroup_dir(box_id);
+        debug!(box_id = %box_id, "[Sandbox] Cleaning up cgroup");
         let _ = tokio::fs::remove_dir(&cgroup_dir).await;
     }
 
     async fn read_memory_peak(&self, box_id: u32) -> u32 {
         let peak_file = self.cgroup_dir(box_id).join("memory.peak");
-        tokio::fs::read_to_string(&peak_file)
+        let memory = tokio::fs::read_to_string(&peak_file)
             .await
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .map(|bytes| (bytes / 1024) as u32) // Convert to KB
-            .unwrap_or(0)
+            .unwrap_or(0);
+        debug!(box_id = %box_id, memory_kb = %memory, peak_file = %peak_file.display(), "[Sandbox] Read memory peak");
+        memory
     }
 
     async fn compile_in_box(
@@ -310,11 +348,20 @@ impl Sandbox {
         code: &str,
     ) -> Result<CompileResult> {
         let config = language.config();
+        debug!(
+            box_id = %box_id,
+            language = ?language,
+            source_file = %config.source_file,
+            "[Sandbox] Compile in box"
+        );
+
         let box_dir = self.init_box(box_id).await?;
 
         tokio::fs::write(box_dir.join(config.source_file), code).await?;
+        debug!(box_id = %box_id, "[Sandbox] Source file written");
 
         let Some(compile_cmd) = config.compile_command else {
+            debug!(box_id = %box_id, "[Sandbox] No compile step needed (interpreted language)");
             return Ok(CompileResult {
                 success: true,
                 error: None,
@@ -322,17 +369,20 @@ impl Sandbox {
             });
         };
 
+        debug!(box_id = %box_id, cmd = ?compile_cmd, "[Sandbox] Running compile command");
         let result = self
             .run_in_box(box_id, compile_cmd, 30000, 512, None)
             .await?;
 
         if result.success {
+            debug!(box_id = %box_id, "[Sandbox] Compile successful");
             Ok(CompileResult {
                 success: true,
                 error: None,
                 box_id: Some(box_id),
             })
         } else {
+            warn!(box_id = %box_id, stderr_len = result.stderr.len(), "[Sandbox] Compile failed");
             Ok(CompileResult {
                 success: false,
                 error: Some(result.stderr),
@@ -413,6 +463,15 @@ impl Sandbox {
         memory_limit_mb: u32,
         stdin_file: Option<&str>,
     ) -> Result<RunResult> {
+        debug!(
+            box_id = %box_id,
+            cmd = ?command,
+            time_limit_ms = %time_limit_ms,
+            memory_limit_mb = %memory_limit_mb,
+            stdin_file = ?stdin_file,
+            "[Sandbox] run_in_box start"
+        );
+
         self.init_cgroup(box_id).await?;
 
         let box_dir = self.box_dir(box_id);
@@ -473,7 +532,16 @@ impl Sandbox {
         let memory = self.read_memory_peak(box_id).await;
         self.cleanup_cgroup(box_id).await;
 
-        Ok(self.build_run_result(exit_code, elapsed, time_limit_ms, memory, stdout, stderr))
+        let result = self.build_run_result(exit_code, elapsed, time_limit_ms, memory, stdout, stderr);
+        debug!(
+            box_id = %box_id,
+            exit_code = %exit_code,
+            elapsed_ms = %elapsed,
+            memory_kb = %memory,
+            status = ?result.status,
+            "[Sandbox] run_in_box complete"
+        );
+        Ok(result)
     }
 
     fn build_run_result(
