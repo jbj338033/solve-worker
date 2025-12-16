@@ -379,6 +379,8 @@ impl Sandbox {
         let mut args = vec![
             // Mode: one-shot
             "-Mo".to_string(),
+            // Quiet mode - suppress nsjail logs
+            "--really_quiet".to_string(),
             // Time limit
             "-t".to_string(),
             format!("{}", time_limit_sec.ceil() as u32),
