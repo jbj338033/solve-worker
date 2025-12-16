@@ -32,7 +32,7 @@ pub struct ExecuteJob {
     pub memory_limit: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JudgeResult {
     Accepted,
@@ -45,10 +45,9 @@ pub enum JudgeResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", rename_all_fields = "camelCase")]
 pub enum JudgeEvent {
     Progress {
-        #[serde(rename = "testcaseId")]
         testcase_id: i64,
         result: JudgeResult,
         time: u32,
@@ -66,13 +65,12 @@ pub enum JudgeEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", rename_all_fields = "camelCase")]
 pub enum ExecuteEvent {
     Ready,
     Stdout { data: String },
     Stderr { data: String },
     Complete {
-        #[serde(rename = "exitCode")]
         exit_code: i32,
         time: u32,
         memory: u32,
@@ -81,7 +79,7 @@ pub enum ExecuteEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", rename_all_fields = "camelCase")]
 pub enum ExecuteCommand {
     Stdin { data: String },
     Kill,
