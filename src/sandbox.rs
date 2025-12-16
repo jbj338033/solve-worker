@@ -1,12 +1,15 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex, Semaphore};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+
+static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use crate::language::Language;
 
@@ -71,6 +74,7 @@ struct ExecuteIoContext {
 
 impl Sandbox {
     pub fn new(max_boxes: usize) -> Self {
+        info!(max_boxes = %max_boxes, "[Sandbox] Initialized");
         Self {
             semaphore: Arc::new(Semaphore::new(max_boxes)),
             box_pool: Arc::new(Mutex::new((0..max_boxes as u32).collect())),
@@ -122,14 +126,15 @@ impl Sandbox {
 
         tokio::fs::write(box_dir.join("input.txt"), input).await?;
 
-        let result = self.run_in_box(
-            box_id,
-            config.execute_command,
-            time_limit,
-            memory_limit,
-            Some("input.txt"),
-        )
-        .await?;
+        let result = self
+            .run_in_box(
+                box_id,
+                config.execute_command,
+                time_limit,
+                memory_limit,
+                Some("input.txt"),
+            )
+            .await?;
 
         debug!(
             box_id = %box_id,
@@ -153,16 +158,18 @@ impl Sandbox {
         memory_limit: u32,
         event_tx: mpsc::Sender<ExecuteOutput>,
     ) -> Result<ExecuteHandle> {
-        self.init_cgroup(box_id).await?;
+        // Generate unique cgroup for this execution
+        let run_id = RUN_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let cgroup_path = PathBuf::from(format!("{}/nsjail-{}-{}", CGROUP_ROOT, box_id, run_id));
+        tokio::fs::create_dir_all(&cgroup_path).await?;
 
         let config = language.config();
         let box_dir = self.box_dir(box_id);
-        let cgroup_path = self.cgroup_dir(box_id);
 
         let time_limit_sec = (time_limit as f64 / 1000.0).max(1.0);
         let memory_mb = memory_limit;
 
-        let mut args = self.base_nsjail_args(box_id, time_limit_sec, memory_mb);
+        let mut args = self.base_nsjail_args(box_id, &cgroup_path, time_limit_sec, memory_mb);
         args.push("--".to_string());
         args.extend(config.execute_command.iter().map(|s| s.to_string()));
 
@@ -234,13 +241,11 @@ impl Sandbox {
                     let _ = stderr_done_rx.recv().await;
                     let elapsed = ctx.start_time.elapsed().as_millis() as u32;
 
-                    let memory = tokio::fs::read_to_string(ctx.cgroup_path.join("memory.peak"))
-                        .await
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u64>().ok())
-                        .map(|bytes| (bytes / 1024) as u32)
-                        .unwrap_or(0);
-                    let _ = tokio::fs::remove_dir(&ctx.cgroup_path).await;
+                    let memory = Self::read_memory_peak_from(&ctx.cgroup_path).await;
+
+                    // Cleanup cgroup asynchronously
+                    let cgroup_path = ctx.cgroup_path.clone();
+                    tokio::spawn(Self::cleanup_cgroup_dir(cgroup_path));
 
                     let _ = ctx.event_tx.send(ExecuteOutput::Complete {
                         exit_code,
@@ -311,36 +316,6 @@ impl Sandbox {
         PathBuf::from(format!("{}/box-{}", SANDBOX_ROOT, box_id))
     }
 
-    fn cgroup_dir(&self, box_id: u32) -> PathBuf {
-        PathBuf::from(format!("{}/nsjail-{}", CGROUP_ROOT, box_id))
-    }
-
-    async fn init_cgroup(&self, box_id: u32) -> Result<()> {
-        let cgroup_dir = self.cgroup_dir(box_id);
-        debug!(box_id = %box_id, cgroup_dir = %cgroup_dir.display(), "[Sandbox] Initializing cgroup");
-        let _ = tokio::fs::remove_dir(&cgroup_dir).await;
-        tokio::fs::create_dir_all(&cgroup_dir).await?;
-        Ok(())
-    }
-
-    async fn cleanup_cgroup(&self, box_id: u32) {
-        let cgroup_dir = self.cgroup_dir(box_id);
-        debug!(box_id = %box_id, "[Sandbox] Cleaning up cgroup");
-        let _ = tokio::fs::remove_dir(&cgroup_dir).await;
-    }
-
-    async fn read_memory_peak(&self, box_id: u32) -> u32 {
-        let peak_file = self.cgroup_dir(box_id).join("memory.peak");
-        let memory = tokio::fs::read_to_string(&peak_file)
-            .await
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|bytes| (bytes / 1024) as u32) // Convert to KB
-            .unwrap_or(0);
-        debug!(box_id = %box_id, memory_kb = %memory, peak_file = %peak_file.display(), "[Sandbox] Read memory peak");
-        memory
-    }
-
     async fn compile_in_box(
         &self,
         box_id: u32,
@@ -391,20 +366,27 @@ impl Sandbox {
         }
     }
 
-    fn base_nsjail_args(&self, box_id: u32, time_limit_sec: f64, memory_mb: u32) -> Vec<String> {
+    fn base_nsjail_args(
+        &self,
+        box_id: u32,
+        cgroup_dir: &std::path::Path,
+        time_limit_sec: f64,
+        memory_mb: u32,
+    ) -> Vec<String> {
         let box_dir = self.box_dir(box_id);
-        let cgroup_dir = self.cgroup_dir(box_id);
         let memory_bytes = (memory_mb as u64) * 1024 * 1024;
 
         let mut args = vec![
+            // Mode: one-shot
             "-Mo".to_string(),
-            "-Q".to_string(),
+            // Time limit
             "-t".to_string(),
             format!("{}", time_limit_sec.ceil() as u32),
+            // Resource limits
             "--rlimit_cpu".to_string(),
             format!("{}", (time_limit_sec * 2.0).ceil() as u32),
             "--rlimit_as".to_string(),
-            format!("{}", memory_mb),
+            "soft".to_string(), // Use soft limit for address space
             "--rlimit_nproc".to_string(),
             "64".to_string(),
             "--rlimit_nofile".to_string(),
@@ -413,23 +395,27 @@ impl Sandbox {
             "10".to_string(),
             "--rlimit_stack".to_string(),
             "soft".to_string(),
+            // User/Group
             "--user".to_string(),
             "99999".to_string(),
             "--group".to_string(),
             "99999".to_string(),
             "--hostname".to_string(),
             "sandbox".to_string(),
+            // Cgroups v2 for memory limiting
             "--use_cgroupv2".to_string(),
             "--cgroupv2_mount".to_string(),
             cgroup_dir.to_string_lossy().to_string(),
             "--cgroup_mem_max".to_string(),
             format!("{}", memory_bytes),
+            // Filesystem mounts - read-only system directories
             "-R".to_string(),
             "/bin".to_string(),
             "-R".to_string(),
             "/lib".to_string(),
         ];
 
+        // /lib64 only exists on x86_64
         if std::path::Path::new("/lib64").exists() {
             args.extend(["-R".to_string(), "/lib64".to_string()]);
         }
@@ -438,18 +424,37 @@ impl Sandbox {
             "-R".to_string(),
             "/usr".to_string(),
             "-R".to_string(),
-            "/etc/alternatives".to_string(),
+            "/etc".to_string(),
+            // /proc - essential for many programs
+            "--proc_rw".to_string(),
+            // /dev - tmpfs with basic devices
+            "--mount".to_string(),
+            "none:/dev:tmpfs:size=4m".to_string(),
+            "--symlink".to_string(),
+            "/dev/null:/dev/null".to_string(),
+            "--symlink".to_string(),
+            "/dev/zero:/dev/zero".to_string(),
+            "--symlink".to_string(),
+            "/dev/urandom:/dev/urandom".to_string(),
+            // /tmp - writable temp directory
+            "--mount".to_string(),
+            "none:/tmp:tmpfs:size=16m".to_string(),
+            // Working directory
             "-B".to_string(),
             format!("{}:/box", box_dir.display()),
             "--cwd".to_string(),
             "/box".to_string(),
+            // Network: use host network (already sandboxed in Docker)
             "--disable_clone_newnet".to_string(),
+            // Environment variables
             "--env".to_string(),
             "PATH=/usr/local/bin:/usr/bin:/bin".to_string(),
             "--env".to_string(),
             "HOME=/box".to_string(),
             "--env".to_string(),
             "LANG=C.UTF-8".to_string(),
+            "--env".to_string(),
+            "LC_ALL=C.UTF-8".to_string(),
         ]);
 
         args
@@ -463,8 +468,13 @@ impl Sandbox {
         memory_limit_mb: u32,
         stdin_file: Option<&str>,
     ) -> Result<RunResult> {
+        // Generate unique cgroup for this run
+        let run_id = RUN_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let cgroup_dir = PathBuf::from(format!("{}/nsjail-{}-{}", CGROUP_ROOT, box_id, run_id));
+
         debug!(
             box_id = %box_id,
+            run_id = %run_id,
             cmd = ?command,
             time_limit_ms = %time_limit_ms,
             memory_limit_mb = %memory_limit_mb,
@@ -472,76 +482,112 @@ impl Sandbox {
             "[Sandbox] run_in_box start"
         );
 
-        self.init_cgroup(box_id).await?;
+        // Create fresh cgroup directory
+        tokio::fs::create_dir_all(&cgroup_dir).await?;
 
         let box_dir = self.box_dir(box_id);
-        let stdout_file = box_dir.join("stdout.txt");
-        let stderr_file = box_dir.join("stderr.txt");
-
         let time_limit_sec = (time_limit_ms as f64 / 1000.0).max(1.0);
 
-        let mut args = self.base_nsjail_args(box_id, time_limit_sec, memory_limit_mb);
+        let mut args = self.base_nsjail_args(box_id, &cgroup_dir, time_limit_sec, memory_limit_mb);
         args.push("--".to_string());
         args.extend(command.iter().map(|s| s.to_string()));
 
+        debug!(box_id = %box_id, run_id = %run_id, "[Sandbox] nsjail args: {:?}", args);
+
         let start_time = Instant::now();
 
-        let mut cmd = Command::new("nsjail");
-        cmd.args(&args).current_dir(&box_dir);
-
-        let (exit_code, elapsed, stdout, stderr) = if let Some(input_file) = stdin_file {
+        // Read input file content if specified
+        let input_content = if let Some(input_file) = stdin_file {
             let input_path = box_dir.join(input_file);
-            let input_content = tokio::fs::read(&input_path).await.unwrap_or_default();
-            cmd.stdin(Stdio::piped());
-
-            let stdout_f = std::fs::File::create(&stdout_file)?;
-            let stderr_f = std::fs::File::create(&stderr_file)?;
-            cmd.stdout(stdout_f);
-            cmd.stderr(stderr_f);
-
-            let mut child = cmd.spawn()?;
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(&input_content).await;
-            }
-            let status = child.wait().await?;
-
-            let elapsed = start_time.elapsed().as_millis() as u32;
-            let exit_code = status.code().unwrap_or(-1);
-
-            let stdout = tokio::fs::read_to_string(&stdout_file).await.unwrap_or_default();
-            let stderr = tokio::fs::read_to_string(&stderr_file).await.unwrap_or_default();
-
-            (exit_code, elapsed, stdout, stderr)
+            tokio::fs::read(&input_path).await.unwrap_or_default()
         } else {
-            let stdout_f = std::fs::File::create(&stdout_file)?;
-            let stderr_f = std::fs::File::create(&stderr_file)?;
-            cmd.stdin(Stdio::null());
-            cmd.stdout(stdout_f);
-            cmd.stderr(stderr_f);
-
-            let status = cmd.status().await?;
-            let elapsed = start_time.elapsed().as_millis() as u32;
-            let exit_code = status.code().unwrap_or(-1);
-
-            let stdout = tokio::fs::read_to_string(&stdout_file).await.unwrap_or_default();
-            let stderr = tokio::fs::read_to_string(&stderr_file).await.unwrap_or_default();
-
-            (exit_code, elapsed, stdout, stderr)
+            Vec::new()
         };
 
-        let memory = self.read_memory_peak(box_id).await;
-        self.cleanup_cgroup(box_id).await;
+        // Spawn nsjail with piped I/O so we can capture everything
+        let mut child = Command::new("nsjail")
+            .args(&args)
+            .current_dir(&box_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
 
-        let result = self.build_run_result(exit_code, elapsed, time_limit_ms, memory, stdout, stderr);
-        debug!(
-            box_id = %box_id,
-            exit_code = %exit_code,
-            elapsed_ms = %elapsed,
-            memory_kb = %memory,
-            status = ?result.status,
-            "[Sandbox] run_in_box complete"
-        );
+        // Write input to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&input_content).await;
+            drop(stdin); // Close stdin to signal EOF
+        }
+
+        // Capture stdout and stderr
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_end(&mut stdout_buf).await;
+        }
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_end(&mut stderr_buf).await;
+        }
+
+        let status = child.wait().await?;
+        let elapsed = start_time.elapsed().as_millis() as u32;
+        let exit_code = status.code().unwrap_or(-1);
+
+        let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+        let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+
+        // Read memory peak from this run's unique cgroup
+        let memory = Self::read_memory_peak_from(&cgroup_dir).await;
+
+        // Cleanup cgroup asynchronously (fire and forget)
+        tokio::spawn(Self::cleanup_cgroup_dir(cgroup_dir));
+
+        let result = self.build_run_result(exit_code, elapsed, time_limit_ms, memory, stdout, stderr.clone());
+
+        if exit_code != 0 {
+            warn!(
+                box_id = %box_id,
+                run_id = %run_id,
+                exit_code = %exit_code,
+                elapsed_ms = %elapsed,
+                memory_kb = %memory,
+                status = ?result.status,
+                stderr = %stderr.chars().take(1000).collect::<String>(),
+                "[Sandbox] run_in_box failed"
+            );
+        } else {
+            debug!(
+                box_id = %box_id,
+                run_id = %run_id,
+                exit_code = %exit_code,
+                elapsed_ms = %elapsed,
+                memory_kb = %memory,
+                status = ?result.status,
+                "[Sandbox] run_in_box complete"
+            );
+        }
         Ok(result)
+    }
+
+    async fn read_memory_peak_from(cgroup_dir: &std::path::Path) -> u32 {
+        let peak_file = cgroup_dir.join("memory.peak");
+        tokio::fs::read_to_string(&peak_file)
+            .await
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|bytes| (bytes / 1024) as u32)
+            .unwrap_or(0)
+    }
+
+    async fn cleanup_cgroup_dir(cgroup_dir: PathBuf) {
+        for _ in 0..20 {
+            if tokio::fs::remove_dir(&cgroup_dir).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        // If still can't remove, it will be cleaned up on container restart
     }
 
     fn build_run_result(
