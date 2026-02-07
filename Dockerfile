@@ -17,7 +17,7 @@ RUN curl -L https://github.com/JetBrains/kotlin/releases/download/v2.0.0/kotlin-
     && rm /tmp/kotlin.zip \
     && ln -s /opt/kotlinc/bin/kotlinc /usr/bin/kotlinc
 
-RUN git clone https://github.com/google/nsjail.git /tmp/nsjail \
+RUN git clone --branch 3.4 --depth 1 https://github.com/google/nsjail.git /tmp/nsjail \
     && cd /tmp/nsjail \
     && make \
     && cp nsjail /usr/local/bin/ \
