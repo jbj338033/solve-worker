@@ -15,6 +15,44 @@ use crate::language::Language;
 
 const SANDBOX_ROOT: &str = "/var/sandbox";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const SECCOMP_POLICY: &str = "\
+POLICY sandbox {\
+  ALLOW {\
+    read, write, open, openat, close, stat, fstat, lstat, newfstatat,\
+    poll, lseek, mmap, mprotect, munmap, brk, mremap, madvise,\
+    rt_sigaction, rt_sigprocmask, rt_sigreturn, rt_sigtimedwait,\
+    ioctl, pread64, pwrite64, readv, writev,\
+    access, faccessat, faccessat2, pipe, pipe2,\
+    select, pselect6, sched_yield, nanosleep, clock_nanosleep,\
+    getitimer, alarm, setitimer,\
+    getpid, getppid, gettid, getuid, getgid, geteuid, getegid,\
+    sendfile,\
+    socket, connect, accept, sendto, recvfrom, sendmsg, recvmsg,\
+    shutdown, bind, listen, getsockname, getpeername, setsockopt, getsockopt,\
+    clone, clone3, fork, vfork, execve, execveat, exit, exit_group, wait4, waitid,\
+    kill, tgkill, tkill,\
+    uname, fcntl, flock, fsync, fdatasync, truncate, ftruncate,\
+    getdents, getdents64, getcwd, chdir, fchdir,\
+    rename, renameat, renameat2, mkdir, mkdirat, rmdir, creat,\
+    link, linkat, unlink, unlinkat, symlink, symlinkat,\
+    readlink, readlinkat, chmod, fchmod, fchmodat,\
+    chown, fchown, lchown, fchownat, umask,\
+    gettimeofday, getrlimit, prlimit64, getrusage, sysinfo, times,\
+    sched_getaffinity, sched_setaffinity,\
+    setuid, setgid, setgroups, setresuid, setresgid,\
+    capget, capset,\
+    sigaltstack, statfs, fstatfs, statx,\
+    arch_prctl, set_tid_address, set_robust_list, get_robust_list,\
+    futex, epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait,\
+    dup, dup2, dup3,\
+    getrandom, memfd_create, copy_file_range,\
+    clock_gettime, clock_getres,\
+    prctl, rseq, close_range, membarrier\
+  }\
+  DEFAULT KILL\
+}\
+USE sandbox DEFAULT KILL\
+";
 
 pub struct Sandbox {
     semaphore: Arc<Semaphore>,
@@ -278,7 +316,7 @@ impl Sandbox {
     async fn acquire_box(&self) -> Result<u32> {
         debug!("[Sandbox] Waiting for available box");
         let permit = self.semaphore.clone().acquire_owned().await?;
-        std::mem::forget(permit);
+        permit.forget();
 
         let mut pool = self.box_pool.lock().await;
         let box_id = pool.pop().ok_or_else(|| anyhow!("No available boxes"))?;
@@ -377,47 +415,41 @@ impl Sandbox {
         let memory_bytes = (memory_mb as u64) * 1024 * 1024;
 
         let mut args = vec![
-            // Mode: one-shot
             "-Mo".to_string(),
-            // Quiet mode - suppress nsjail logs
             "--really_quiet".to_string(),
-            // Time limit
             "-t".to_string(),
             format!("{}", time_limit_sec.ceil() as u32),
-            // Resource limits
             "--rlimit_cpu".to_string(),
             format!("{}", (time_limit_sec * 2.0).ceil() as u32),
             "--rlimit_as".to_string(),
-            "soft".to_string(), // Use soft limit for address space
+            "soft".to_string(),
             "--rlimit_nproc".to_string(),
-            "64".to_string(),
+            "32".to_string(),
             "--rlimit_nofile".to_string(),
             "64".to_string(),
             "--rlimit_fsize".to_string(),
             "10".to_string(),
             "--rlimit_stack".to_string(),
             "soft".to_string(),
-            // User/Group
             "--user".to_string(),
             "99999".to_string(),
             "--group".to_string(),
             "99999".to_string(),
             "--hostname".to_string(),
             "sandbox".to_string(),
-            // Cgroups v2 for memory limiting
             "--use_cgroupv2".to_string(),
             "--cgroupv2_mount".to_string(),
             cgroup_dir.to_string_lossy().to_string(),
             "--cgroup_mem_max".to_string(),
             format!("{}", memory_bytes),
-            // Filesystem mounts - read-only system directories
+            "--seccomp_string".to_string(),
+            SECCOMP_POLICY.to_string(),
             "-R".to_string(),
             "/bin".to_string(),
             "-R".to_string(),
             "/lib".to_string(),
         ];
 
-        // /lib64 only exists on x86_64
         if std::path::Path::new("/lib64").exists() {
             args.extend(["-R".to_string(), "/lib64".to_string()]);
         }
@@ -426,10 +458,13 @@ impl Sandbox {
             "-R".to_string(),
             "/usr".to_string(),
             "-R".to_string(),
-            "/etc".to_string(),
-            // /proc - essential for many programs
-            "--proc_rw".to_string(),
-            // /dev - tmpfs with basic devices
+            "/etc/alternatives".to_string(),
+            "-R".to_string(),
+            "/etc/ld.so.cache".to_string(),
+            "-R".to_string(),
+            "/etc/localtime".to_string(),
+            "--mount".to_string(),
+            "none:/proc:proc".to_string(),
             "--mount".to_string(),
             "none:/dev:tmpfs:size=4m".to_string(),
             "--symlink".to_string(),
@@ -438,17 +473,12 @@ impl Sandbox {
             "/dev/zero:/dev/zero".to_string(),
             "--symlink".to_string(),
             "/dev/urandom:/dev/urandom".to_string(),
-            // /tmp - writable temp directory
             "--mount".to_string(),
             "none:/tmp:tmpfs:size=16m".to_string(),
-            // Working directory
             "-B".to_string(),
             format!("{}:/box", box_dir.display()),
             "--cwd".to_string(),
             "/box".to_string(),
-            // Network: use host network (already sandboxed in Docker)
-            "--disable_clone_newnet".to_string(),
-            // Environment variables
             "--env".to_string(),
             "PATH=/usr/local/bin:/usr/bin:/bin".to_string(),
             "--env".to_string(),
